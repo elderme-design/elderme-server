@@ -3,6 +3,12 @@ import express from "express";
 import OpenAI from "openai";
 import twilio from "twilio";
 
+// ⬇️ extra imports for Google TTS + file handling
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
+import { TextToSpeechClient } from "@google-cloud/text-to-speech";
+
 const app = express(); // required
 
 // Twilio posts x-www-form-urlencoded; keep both parsers
@@ -13,15 +19,39 @@ app.use(express.json());
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
 const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
-const TWILIO_NUMBER = process.env.TWILIO_FROM_NUMBER || process.env.TWILIO_PHONE_NUMBER;
+const TWILIO_NUMBER =
+  process.env.TWILIO_FROM_NUMBER || process.env.TWILIO_PHONE_NUMBER;
 const CALL_ME_SECRET = process.env.CALL_ME_SECRET || "changeme";
 
-if (!OPENAI_API_KEY) console.warn("⚠️ OPENAI_API_KEY is not set");
-if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) console.warn("⚠️ Twilio SID/TOKEN not set");
-if (!TWILIO_NUMBER) console.warn("⚠️ TWILIO_FROM_NUMBER / TWILIO_PHONE_NUMBER not set");
+// Public base URL of THIS server (Render env var)
+const PUBLIC_URL =
+  process.env.PUBLIC_URL || "https://elderme-server.onrender.com";
 
+// Default Google voice (change if you want)
+const GOOGLE_TTS_VOICE = process.env.GOOGLE_TTS_VOICE || "en-US-Neural2-F";
+
+// Basic checks
+if (!OPENAI_API_KEY) console.warn("⚠️ OPENAI_API_KEY is not set");
+if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN)
+  console.warn("⚠️ Twilio SID/TOKEN not set");
+if (!TWILIO_NUMBER)
+  console.warn("⚠️ TWILIO_FROM_NUMBER / TWILIO_PHONE_NUMBER not set");
+
+// ⬇️ Google TTS key comes from Render env GOOGLE_TTS_KEY (full JSON)
+if (!process.env.GOOGLE_TTS_KEY) {
+  console.error("⚠️ GOOGLE_TTS_KEY not set in environment");
+} else {
+  const __filename = fileURLToPath(import.meta.url);
+  const __dirname = path.dirname(__filename);
+  const keyPath = path.join(__dirname, "google-tts.json");
+  fs.writeFileSync(keyPath, process.env.GOOGLE_TTS_KEY);
+  process.env.GOOGLE_APPLICATION_CREDENTIALS = keyPath;
+}
+
+// Clients
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 const twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
+const googleTTS = new TextToSpeechClient();
 
 /* ========= HELPERS ========= */
 function toE164(num) {
@@ -29,13 +59,35 @@ function toE164(num) {
   return s.startsWith("+") ? s : `+${s}`;
 }
 
+// where to drop audio files
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const AUDIO_DIR = path.join(__dirname, "audio");
+if (!fs.existsSync(AUDIO_DIR)) fs.mkdirSync(AUDIO_DIR);
+// serve them so Twilio can fetch
+app.use("/audio", express.static(AUDIO_DIR));
+
+async function synthesizeToUrl(text, voiceName = GOOGLE_TTS_VOICE) {
+  const [resp] = await googleTTS.synthesizeSpeech({
+    input: { text },
+    voice: { languageCode: voiceName.slice(0, 5), name: voiceName },
+    audioConfig: { audioEncoding: "MP3" },
+  });
+  const filename = `tts_${Date.now()}_${Math.random()
+    .toString(36)
+    .slice(2)}.mp3`;
+  const filepath = path.join(AUDIO_DIR, filename);
+  fs.writeFileSync(filepath, resp.audioContent, "binary");
+  return `${PUBLIC_URL}/audio/${filename}`;
+}
+
 /* ========= HEALTH ========= */
 app.get("/", (_req, res) => res.send("ElderMe server up ✅"));
 
-/* ========= INBOUND CALL: Twilio -> (your webhook) -> OpenAI -> speak back ========= */
+/* ========= INBOUND CALL: Twilio -> (your webhook) -> OpenAI -> Google TTS ========= */
 
 // 1) Twilio hits this when the call arrives. We prompt & start speech recognition.
-app.post("/twilio-voice", (req, res) => {
+app.post("/twilio-voice", async (req, res) => {
   const vr = new twilio.twiml.VoiceResponse();
 
   const gather = vr.gather({
@@ -46,11 +98,17 @@ app.post("/twilio-voice", (req, res) => {
     method: "POST",
   });
 
-  // First line the caller hears (short and friendly)
-  gather.say(
-    { voice: "Polly.Joanna", language: "en-US" },
-    "Hi, I’m ElderMe. Tell me anything that’s on your mind, and I’ll talk with you."
-  );
+  // New greeting script (Google voice)
+  const greeting =
+    "Hey what's up, it's ElderMe, hope you're good today. Just calling to catch up, got time to chat for a bit?";
+
+  try {
+    const url = await synthesizeToUrl(greeting);
+    gather.play(url);
+  } catch (e) {
+    console.error("Google TTS greeting failed, fallback to Twilio <Say>:", e);
+    gather.say({ voice: "Polly.Joanna", language: "en-US" }, greeting);
+  }
 
   // If nothing was said, ask again
   vr.redirect("/twilio-voice");
@@ -66,7 +124,10 @@ app.post("/twilio-gather", async (req, res) => {
     const userText = (req.body.SpeechResult || "").trim();
 
     if (!userText) {
-      vr.say("Sorry, I didn’t catch that. Please say something.");
+      const url = await synthesizeToUrl(
+        "Sorry, I didn’t catch that. Please say something."
+      );
+      vr.play(url);
       vr.redirect("/twilio-voice");
       return res.type("text/xml").send(vr.toString());
     }
@@ -89,7 +150,9 @@ app.post("/twilio-gather", async (req, res) => {
       completion.choices?.[0]?.message?.content?.trim() ||
       "I’m here with you. Tell me more.";
 
-    vr.say({ voice: "Polly.Joanna", language: "en-US" }, reply);
+    // Speak reply with Google TTS
+    const replyUrl = await synthesizeToUrl(reply);
+    vr.play(replyUrl);
 
     // Offer another turn (keeps the conversation going)
     const again = vr.gather({
@@ -99,12 +162,20 @@ app.post("/twilio-gather", async (req, res) => {
       action: "/twilio-gather",
       method: "POST",
     });
+    // Keep this short; using Twilio here avoids another TTS call. Swap to Google if you prefer.
     again.say("You can keep talking if you’d like.");
 
     res.type("text/xml").send(vr.toString());
   } catch (e) {
-    console.error("OpenAI/Twilio error:", e);
-    vr.say("Sorry, something went wrong on my end. Let's try again later.");
+    console.error("OpenAI/Google TTS error:", e);
+    try {
+      const url = await synthesizeToUrl(
+        "Sorry, something went wrong on my end. Let's try again later."
+      );
+      vr.play(url);
+    } catch {
+      vr.say("Sorry, something went wrong on my end. Let's try again later.");
+    }
     vr.hangup();
     res.type("text/xml").send(vr.toString());
   }
@@ -120,7 +191,9 @@ app.post("/call-me", async (req, res) => {
     }
 
     if (!TWILIO_NUMBER) {
-      return res.status(500).json({ error: "Missing TWILIO_PHONE_NUMBER / TWILIO_FROM_NUMBER" });
+      return res
+        .status(500)
+        .json({ error: "Missing TWILIO_PHONE_NUMBER / TWILIO_FROM_NUMBER" });
     }
 
     const to = toE164(req.body.to);
@@ -132,7 +205,7 @@ app.post("/call-me", async (req, res) => {
     const call = await twilioClient.calls.create({
       to,
       from: TWILIO_NUMBER,
-      url: "https://elderme-server.onrender.com/twilio-voice",
+      url: `${PUBLIC_URL}/twilio-voice`,
       method: "POST",
     });
 

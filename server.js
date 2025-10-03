@@ -3,11 +3,15 @@ import express from "express";
 import OpenAI from "openai";
 import twilio from "twilio";
 
-// ⬇️ extra imports for Google TTS + file handling
+// ⬇️ extra imports for Google TTS + file handling (kept for optional use)
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import { TextToSpeechClient } from "@google-cloud/text-to-speech";
+
+// ⬇️ NEW: http server + WebSocket for Media Streams
+import http from "http";
+import { WebSocketServer } from "ws";
 
 const app = express();
 app.use(express.urlencoded({ extended: true }));
@@ -21,9 +25,12 @@ const TWILIO_NUMBER =
   process.env.TWILIO_FROM_NUMBER || process.env.TWILIO_PHONE_NUMBER;
 const CALL_ME_SECRET = process.env.CALL_ME_SECRET || "changeme";
 
-// Public base URL (Render env)
-const PUBLIC_URL =
-  process.env.PUBLIC_URL || "https://elderme-server.onrender.com";
+// Public base URL (Render env) — must be your public https URL
+const PUBLIC_URL = process.env.PUBLIC_URL || "https://elderme-server.onrender.com";
+
+// ✅ If you prefer, set PUBLIC_WS explicitly. Otherwise we derive it from PUBLIC_URL.
+const PUBLIC_WS =
+  process.env.PUBLIC_WS || PUBLIC_URL.replace(/^http(s?):\/\//, "wss://");
 
 // ✅ Change this voice to male (Google Wavenet-D)
 const GOOGLE_TTS_VOICE = process.env.GOOGLE_TTS_VOICE || "en-US-Wavenet-D";
@@ -38,12 +45,6 @@ if (!TWILIO_NUMBER)
 // ⬇️ Google TTS key comes from Render env GOOGLE_TTS_KEY (full JSON)
 if (!process.env.GOOGLE_TTS_KEY) {
   console.error("⚠️ GOOGLE_TTS_KEY not set in environment");
-} else {
-  const __filename = fileURLToPath(import.meta.url);
-  const __dirname = path.dirname(__filename);
-  const keyPath = path.join(__dirname, "google-tts.json");
-  fs.writeFileSync(keyPath, process.env.GOOGLE_TTS_KEY);
-  process.env.GOOGLE_APPLICATION_CREDENTIALS = keyPath;
 }
 
 // Clients
@@ -51,20 +52,21 @@ const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 const twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 const googleTTS = new TextToSpeechClient();
 
-/* ========= HELPERS ========= */
-function toE164(num) {
-  const s = String(num || "").replace(/[^\d+]/g, "");
-  return s.startsWith("+") ? s : `+${s}`;
-}
-
-// where to drop audio files
+// where to drop audio files (for optional <Play> usage)
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const AUDIO_DIR = path.join(__dirname, "audio");
 if (!fs.existsSync(AUDIO_DIR)) fs.mkdirSync(AUDIO_DIR);
 app.use("/audio", express.static(AUDIO_DIR));
 
+/* ========= HELPERS ========= */
+function toE164(num) {
+  const s = String(num || "").replace(/[^\d+]/g, "");
+  return s.startsWith("+") ? s : `+${s}`;
+}
+
 async function synthesizeToUrl(text, voiceName = GOOGLE_TTS_VOICE) {
+  // Optional helper: still available if you want a pre-stream greeting via <Play>
   const [resp] = await googleTTS.synthesizeSpeech({
     input: { text },
     voice: {
@@ -83,99 +85,37 @@ async function synthesizeToUrl(text, voiceName = GOOGLE_TTS_VOICE) {
 }
 
 /* ========= HEALTH ========= */
-app.get("/", (_req, res) => res.send("ElderMe server up ✅"));
+app.get("/", (_req, res) => res.send("ElderMe server up ✅ (Media Streams)"));
 
-/* ========= INBOUND CALL ========= */
-
-app.post("/twilio-voice", async (req, res) => {
+/* ========= INBOUND CALL (Media Streams) =========
+   This returns TwiML that:
+   (1) Optionally says a very short greeting
+   (2) Starts a bidirectional media stream to wss://.../media
+*/
+app.post("/voice", async (req, res) => {
   const vr = new twilio.twiml.VoiceResponse();
 
-  const gather = vr.gather({
-    input: "speech",
-    language: "en-US",
-    speechTimeout: "auto",
-    action: "/twilio-gather",
-    method: "POST",
+  // Optional: quick greeting BEFORE we connect the live stream.
+  // Keep it <2s so the stream starts fast. Comment out if you want instant stream.
+  vr.say({ voice: "Polly.Matthew", language: "en-US" }, "Hi, it's ElderMe.");
+  // Alternatively, use your Google TTS file:
+  // const url = await synthesizeToUrl("Hi, it's ElderMe.");
+  // vr.play(url);
+
+  // ⬇️ Start the live audio stream to your WebSocket endpoint
+  const connect = vr.connect();
+  connect.stream({
+    url: `${PUBLIC_WS}/media`,
+    // Optional params you can read on 'start' event:
+    parameter: [{ name: "callSid", value: req.body.CallSid || "" }],
   });
 
-  const greeting =
-    "Hey what's up, it's ElderMe, hope you're good today. Just calling to catch up, got time to chat for a bit?";
-
-  try {
-    const url = await synthesizeToUrl(greeting);
-    gather.play(url);
-  } catch (e) {
-    console.error("Google TTS greeting failed, fallback to Twilio male:", e);
-    gather.say({ voice: "Polly.Matthew", language: "en-US" }, greeting);
-  }
-
-  vr.redirect("/twilio-voice");
   res.type("text/xml").send(vr.toString());
 });
 
-/* ========= GPT Conversation Loop ========= */
-app.post("/twilio-gather", async (req, res) => {
-  const vr = new twilio.twiml.VoiceResponse();
-
-  try {
-    const userText = (req.body.SpeechResult || "").trim();
-
-    if (!userText) {
-      const url = await synthesizeToUrl(
-        "Sorry, I didn’t catch that. Please say something."
-      );
-      vr.play(url);
-      vr.redirect("/twilio-voice");
-      return res.type("text/xml").send(vr.toString());
-    }
-
-    const completion = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [
-        {
-          role: "system",
-          content:
-            "You are ElderMe, a warm, concise phone companion. Speak naturally and keep replies under 20 seconds.",
-        },
-        { role: "user", content: userText },
-      ],
-      max_tokens: 150,
-      temperature: 0.7,
-    });
-
-    const reply =
-      completion.choices?.[0]?.message?.content?.trim() ||
-      "I’m here with you. Tell me more.";
-
-    const replyUrl = await synthesizeToUrl(reply);
-    vr.play(replyUrl);
-
-    const again = vr.gather({
-      input: "speech",
-      language: "en-US",
-      speechTimeout: "auto",
-      action: "/twilio-gather",
-      method: "POST",
-    });
-    again.say("You can keep talking if you’d like.");
-
-    res.type("text/xml").send(vr.toString());
-  } catch (e) {
-    console.error("OpenAI/Google TTS error:", e);
-    try {
-      const url = await synthesizeToUrl(
-        "Sorry, something went wrong on my end. Let's try again later."
-      );
-      vr.play(url);
-    } catch {
-      vr.say("Sorry, something went wrong on my end. Let's try again later.");
-    }
-    vr.hangup();
-    res.type("text/xml").send(vr.toString());
-  }
-});
-
-/* ========= OUTBOUND CALL ========= */
+/* ========= OUTBOUND CALL (kept) =========
+   This now points to /voice (the Media Streams route), not /twilio-voice.
+*/
 app.post("/call-me", async (req, res) => {
   try {
     if (CALL_ME_SECRET && req.body.secret !== CALL_ME_SECRET)
@@ -188,7 +128,7 @@ app.post("/call-me", async (req, res) => {
     const call = await twilioClient.calls.create({
       to,
       from: TWILIO_NUMBER,
-      url: `${PUBLIC_URL}/twilio-voice`,
+      url: `${PUBLIC_URL}/voice`,
       method: "POST",
     });
 
@@ -199,6 +139,103 @@ app.post("/call-me", async (req, res) => {
   }
 });
 
+/* ========= WEB SOCKET: /media =========
+   Twilio connects here and sends JSON messages:
+   - {event:"start", start:{streamSid,...}}
+   - {event:"media", media:{payload: base64(PCMU 8k)}}
+   - {event:"stop", ...}
+
+   If you want full duplex (bot talks back), send:
+   ws.send(JSON.stringify({
+     event: "media",
+     streamSid,
+     media: { payload: base64PCMU_8k }
+   }));
+*/
+const server = http.createServer(app);
+const wss = new WebSocketServer({ server, path: "/media" });
+
+// 🔧 Toggle: simple loopback test (echo caller audio back to them). Beware of echo.
+// Set to true for a quick “it works” test. Set false when wiring OpenAI.
+const LOOPBACK_TEST = false;
+
+wss.on("connection", (ws, req) => {
+  let streamSid = null;
+  let callSid = null;
+
+  ws.on("message", async (msgBuf) => {
+    try {
+      const data = JSON.parse(msgBuf.toString());
+
+      switch (data.event) {
+        case "start":
+          streamSid = data.start.streamSid;
+          // If you passed parameters in <Connect><Stream>, they show here:
+          const params = (data.start.customParameters || []).reduce((acc, p) => {
+            acc[p.name] = p.value;
+            return acc;
+          }, {});
+          callSid = params.callSid || null;
+          console.log("📞 Stream started:", { streamSid, callSid });
+          break;
+
+        case "media": {
+          // Inbound media from the caller (μ-law 8kHz as base64)
+          const base64PCMU = data.media.payload;
+
+          // TODO: decode PCMU → PCM16 → send into your STT/LLM (OpenAI Realtime, etc.)
+          // TODO: take bot's PCM16 output → encode to PCMU 8kHz → send back as below.
+
+          if (LOOPBACK_TEST && streamSid) {
+            // ⚠️ This will echo the caller's voice back (proof WS send works).
+            ws.send(
+              JSON.stringify({
+                event: "media",
+                streamSid,
+                media: { payload: base64PCMU },
+              })
+            );
+          }
+          break;
+        }
+
+        case "stop":
+          console.log("🛑 Stream stopped:", { streamSid, callSid });
+          streamSid = null;
+          break;
+
+        default:
+          // ignore
+          break;
+      }
+    } catch (err) {
+      console.error("WS message parse error:", err);
+    }
+  });
+
+  ws.on("close", () => {
+    console.log("WS closed", { streamSid, callSid });
+  });
+});
+
 /* ========= START SERVER ========= */
 const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`Listening on ${port}`));
+server.listen(port, () => console.log(`Listening on ${port} (WS ready at ${PUBLIC_WS}/media)`));
+
+/* ========= NOTES =========
+1) Twilio Console → Phone Number → Voice → A Call Comes In:
+   POST  https://YOUR-RENDER-APP/voice
+
+2) Ensure PUBLIC_URL is set in Render to your exact https base, e.g.:
+   PUBLIC_URL = https://elderme-server.onrender.com
+   (Optional) PUBLIC_WS if your WS host differs; otherwise we derive from PUBLIC_URL.
+
+3) For full duplex with a talking bot:
+   - Decode μ-law 8k to PCM16 (8k), stream into OpenAI Realtime/STT.
+   - Get PCM16 output back, downsample to 8k if needed, encode μ-law,
+     base64 it, and send as the 'media' event shown above.
+   - Keep total buffering small (20–40ms frames) to avoid lag.
+
+4) You can delete the old /twilio-voice and /twilio-gather routes.
+   This file replaces them with /voice (Media Streams).
+*/

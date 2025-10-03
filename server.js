@@ -9,9 +9,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { TextToSpeechClient } from "@google-cloud/text-to-speech";
 
-const app = express(); // required
-
-// Twilio posts x-www-form-urlencoded; keep both parsers
+const app = express();
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
@@ -23,12 +21,12 @@ const TWILIO_NUMBER =
   process.env.TWILIO_FROM_NUMBER || process.env.TWILIO_PHONE_NUMBER;
 const CALL_ME_SECRET = process.env.CALL_ME_SECRET || "changeme";
 
-// Public base URL of THIS server (Render env var)
+// Public base URL (Render env)
 const PUBLIC_URL =
   process.env.PUBLIC_URL || "https://elderme-server.onrender.com";
 
-// Default Google voice (change if you want)
-const GOOGLE_TTS_VOICE = process.env.GOOGLE_TTS_VOICE || "en-US-Neural2-F";
+// ✅ Change this voice to male (Google Wavenet-D)
+const GOOGLE_TTS_VOICE = process.env.GOOGLE_TTS_VOICE || "en-US-Wavenet-D";
 
 // Basic checks
 if (!OPENAI_API_KEY) console.warn("⚠️ OPENAI_API_KEY is not set");
@@ -64,13 +62,16 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const AUDIO_DIR = path.join(__dirname, "audio");
 if (!fs.existsSync(AUDIO_DIR)) fs.mkdirSync(AUDIO_DIR);
-// serve them so Twilio can fetch
 app.use("/audio", express.static(AUDIO_DIR));
 
 async function synthesizeToUrl(text, voiceName = GOOGLE_TTS_VOICE) {
   const [resp] = await googleTTS.synthesizeSpeech({
     input: { text },
-    voice: { languageCode: voiceName.slice(0, 5), name: voiceName },
+    voice: {
+      languageCode: voiceName.slice(0, 5),
+      name: voiceName,
+      ssmlGender: "MALE",
+    },
     audioConfig: { audioEncoding: "MP3" },
   });
   const filename = `tts_${Date.now()}_${Math.random()
@@ -84,9 +85,8 @@ async function synthesizeToUrl(text, voiceName = GOOGLE_TTS_VOICE) {
 /* ========= HEALTH ========= */
 app.get("/", (_req, res) => res.send("ElderMe server up ✅"));
 
-/* ========= INBOUND CALL: Twilio -> (your webhook) -> OpenAI -> Google TTS ========= */
+/* ========= INBOUND CALL ========= */
 
-// 1) Twilio hits this when the call arrives. We prompt & start speech recognition.
 app.post("/twilio-voice", async (req, res) => {
   const vr = new twilio.twiml.VoiceResponse();
 
@@ -94,11 +94,10 @@ app.post("/twilio-voice", async (req, res) => {
     input: "speech",
     language: "en-US",
     speechTimeout: "auto",
-    action: "/twilio-gather", // Twilio will POST transcript here
+    action: "/twilio-gather",
     method: "POST",
   });
 
-  // New greeting script (Google voice)
   const greeting =
     "Hey what's up, it's ElderMe, hope you're good today. Just calling to catch up, got time to chat for a bit?";
 
@@ -106,17 +105,15 @@ app.post("/twilio-voice", async (req, res) => {
     const url = await synthesizeToUrl(greeting);
     gather.play(url);
   } catch (e) {
-    console.error("Google TTS greeting failed, fallback to Twilio <Say>:", e);
-    gather.say({ voice: "Polly.Joanna", language: "en-US" }, greeting);
+    console.error("Google TTS greeting failed, fallback to Twilio male:", e);
+    gather.say({ voice: "Polly.Matthew", language: "en-US" }, greeting);
   }
 
-  // If nothing was said, ask again
   vr.redirect("/twilio-voice");
-
   res.type("text/xml").send(vr.toString());
 });
 
-// 2) Twilio posts the transcript here. We call OpenAI and speak the reply, then loop.
+/* ========= GPT Conversation Loop ========= */
 app.post("/twilio-gather", async (req, res) => {
   const vr = new twilio.twiml.VoiceResponse();
 
@@ -138,7 +135,7 @@ app.post("/twilio-gather", async (req, res) => {
         {
           role: "system",
           content:
-            "You are ElderMe, a warm, concise phone companion. Speak naturally and keep replies under about 20 seconds.",
+            "You are ElderMe, a warm, concise phone companion. Speak naturally and keep replies under 20 seconds.",
         },
         { role: "user", content: userText },
       ],
@@ -150,11 +147,9 @@ app.post("/twilio-gather", async (req, res) => {
       completion.choices?.[0]?.message?.content?.trim() ||
       "I’m here with you. Tell me more.";
 
-    // Speak reply with Google TTS
     const replyUrl = await synthesizeToUrl(reply);
     vr.play(replyUrl);
 
-    // Offer another turn (keeps the conversation going)
     const again = vr.gather({
       input: "speech",
       language: "en-US",
@@ -162,7 +157,6 @@ app.post("/twilio-gather", async (req, res) => {
       action: "/twilio-gather",
       method: "POST",
     });
-    // Keep this short; using Twilio here avoids another TTS call. Swap to Google if you prefer.
     again.say("You can keep talking if you’d like.");
 
     res.type("text/xml").send(vr.toString());
@@ -181,27 +175,16 @@ app.post("/twilio-gather", async (req, res) => {
   }
 });
 
-/* ========= OUTBOUND CALL: trigger a call to your phone and enter the AI flow =========
-   POST /call-me  { "to": "+1YOURCELLPHONE", "secret": "YOUR_SECRET" }
-*/
+/* ========= OUTBOUND CALL ========= */
 app.post("/call-me", async (req, res) => {
   try {
-    if (CALL_ME_SECRET && req.body.secret !== CALL_ME_SECRET) {
+    if (CALL_ME_SECRET && req.body.secret !== CALL_ME_SECRET)
       return res.status(401).json({ error: "Unauthorized" });
-    }
-
-    if (!TWILIO_NUMBER) {
-      return res
-        .status(500)
-        .json({ error: "Missing TWILIO_PHONE_NUMBER / TWILIO_FROM_NUMBER" });
-    }
 
     const to = toE164(req.body.to);
-    if (!/^\+\d{10,15}$/.test(to)) {
+    if (!/^\+\d{10,15}$/.test(to))
       return res.status(400).json({ error: "Invalid phone number" });
-    }
 
-    // When you answer, Twilio requests /twilio-voice, which starts the OpenAI loop
     const call = await twilioClient.calls.create({
       to,
       from: TWILIO_NUMBER,

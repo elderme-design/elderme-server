@@ -24,7 +24,7 @@ const CALL_ME_SECRET = process.env.CALL_ME_SECRET || "changeme";
 const PUBLIC_URL = process.env.PUBLIC_URL || "https://elderme-server.onrender.com";
 const PUBLIC_WS = process.env.PUBLIC_WS || PUBLIC_URL.replace(/^http(s?):\/\//, "wss://");
 
-// Google TTS voice (change if you like)
+// Google TTS voice
 const GOOGLE_TTS_VOICE = process.env.GOOGLE_TTS_VOICE || "en-US-Wavenet-D";
 
 // sanity logs
@@ -117,10 +117,10 @@ async function sendMulawStream(ws, streamSid, mulawBuf) {
   }
 }
 
-// Minimal WAV (8kHz mono, PCM16) — handy for temp files / /tts
+// Minimal WAV (8kHz mono, PCM16)
 function pcm16ToWav8kMono(pcm) {
   const sampleRate = 8000;
-  const byteRate = sampleRate * 2; // 16-bit mono
+  const byteRate = sampleRate * 2;
   const blockAlign = 2;
   const bitsPerSample = 16;
   const dataSize = pcm.length;
@@ -144,20 +144,50 @@ function pcm16ToWav8kMono(pcm) {
   return buf;
 }
 
-/* ========= Google TTS (8kHz PCM16) ========= */
+/* ========= TTS with in-memory CACHE + Prewarm ========= */
+// Simple cache to avoid repeated network synth for same text
+const ttsCache = new Map(); // key: text -> value: { pcm: Buffer, mulaw: Buffer }
+const NUDGE_LINES = [
+  "Hey YawYaw, are you going tonight with Adnan?",
+  "Hey YawYaw- your wife Rose told me to call you. Are you smoking hookah tonight??",
+  "Hey YawYaw yout son Zack and dad told me to call you. How are you feeling right now?",
+];
+
+// synthesize PCM16 (8k) and also keep a μ-law copy in cache
 async function synthesizePcm16_8k(text) {
   if (!googleReady) throw new Error("Google TTS not configured (GOOGLE_TTS_KEY)");
+  if (ttsCache.has(text)) return ttsCache.get(text).pcm;
+
   const [resp] = await googleTTS.synthesizeSpeech({
     input: { text },
-    voice: {
-      languageCode: GOOGLE_TTS_VOICE.slice(0, 5), // e.g., en-US
-      name: GOOGLE_TTS_VOICE,
-      ssmlGender: "NEUTRAL",
-    },
+    voice: { languageCode: GOOGLE_TTS_VOICE.slice(0, 5), name: GOOGLE_TTS_VOICE, ssmlGender: "NEUTRAL" },
     audioConfig: { audioEncoding: "LINEAR16", sampleRateHertz: 8000 },
   });
-  return Buffer.from(resp.audioContent);
+  const pcm = Buffer.from(resp.audioContent);
+  const mulaw = encodePcm16ToMulaw(pcm);
+  ttsCache.set(text, { pcm, mulaw });
+  return pcm;
 }
+
+function getCachedMulaw(text) {
+  const hit = ttsCache.get(text);
+  return hit ? hit.mulaw : null;
+}
+
+// Prewarm a default greeting at boot for instant first audio
+const BOOT_GREETING_TEXT = NUDGE_LINES[0];
+let BOOT_GREETING_MULAW = null;
+(async () => {
+  try {
+    if (googleReady) {
+      const pcm = await synthesizePcm16_8k(BOOT_GREETING_TEXT);
+      BOOT_GREETING_MULAW = encodePcm16ToMulaw(pcm);
+      console.log("✅ Prewarmed greeting audio.");
+    }
+  } catch (e) {
+    console.warn("⚠️ Failed to prewarm greeting:", e.message);
+  }
+})();
 
 /* ========= /tts demo (returns WAV) ========= */
 app.get("/tts", async (req, res) => {
@@ -173,7 +203,7 @@ app.get("/tts", async (req, res) => {
   }
 });
 
-/* ========= OpenAI (Whisper) ========= */
+/* ========= OpenAI (Whisper + Chat) ========= */
 async function transcribeWhisper(pcm16Buf) {
   const wav = pcm16ToWav8kMono(pcm16Buf);
   const tmp = path.join(AUDIO_DIR, `chunk_${Date.now()}.wav`);
@@ -222,11 +252,16 @@ app.get("/", (_req, res) =>
 /* ========= INBOUND CALL (Twilio Media Streams) ========= */
 app.all("/voice", (req, res) => {
   console.log("✓ /voice hit. CallSid:", req.body.CallSid, "From:", req.body.From);
+
   const vr = new twilio.twiml.VoiceResponse();
+
+  // Optional: Say a 1-second line immediately while WS connects (fastest perceived start)
+  vr.say({ voice: "Polly.Joanna", language: "en-US" }, "Hi, one moment…");
+
   const connect = vr.connect();
   const stream = connect.stream({ url: `${PUBLIC_WS}/media` });
-  // Pass CallSid properly
   stream.parameter({ name: "callSid", value: req.body.CallSid || "" });
+
   res.type("text/xml").send(vr.toString());
 });
 
@@ -248,7 +283,7 @@ app.post("/call-me", async (req, res) => {
       statusCallback: `${PUBLIC_URL}/twilio-status`,
       statusCallbackMethod: "POST",
       statusCallbackEvent: ["initiated", "ringing", "answered", "completed"],
-      answerOnBridge: true,
+      answerOnBridge: true, // media starts when answered (keeps ringback clean)
     });
 
     res.json({ ok: true, sid: call.sid });
@@ -302,13 +337,6 @@ app.post("/twilio-status", (req, res) => {
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: "/media" });
 
-// Rotateable nudge lines — edit these to change the opening prompt.
-const NUDGE_LINES = [
-  "Hey Rashid, your daughter Cyma told me to call.",
-  " Hey Rashid, your daughter Cyma told me to call . Do you still work with Haroon Shaikh?",
-  " Hey Rashid, your daughter Cyma told me to call . What’s on your mind right now?",
-];
-
 function makeState(ws, streamSid, callSid) {
   return {
     ws, streamSid, callSid,
@@ -321,28 +349,38 @@ function makeState(ws, streamSid, callSid) {
   };
 }
 
-function scheduleNudge(state) {
+// Speak helper — uses cache & prewarmed greeting for instant first audio
+async function speakText(state, text) {
+  try {
+    state.listening = false;
+
+    // If the text is prewarmed or cached, use it instantly
+    let mulaw = getCachedMulaw(text);
+    if (!mulaw) {
+      if (BOOT_GREETING_MULAW && text === BOOT_GREETING_TEXT) {
+        mulaw = BOOT_GREETING_MULAW;
+      } else {
+        const pcm = await synthesizePcm16_8k(text);
+        mulaw = encodePcm16ToMulaw(pcm);
+      }
+    }
+    await sendMulawStream(state.ws, state.streamSid, mulaw);
+  } catch (e) {
+    console.warn("TTS/speak error:", e.stack || e.message);
+  } finally {
+    state.listening = true;
+  }
+}
+
+// Nudge scheduler — default 0ms now (instant)
+function scheduleNudge(state, delayMs = 0) {
   if (state.nudgeTimer) clearTimeout(state.nudgeTimer);
   state.nudgeTimer = setTimeout(async () => {
     if (!state || !state.listening) return;
     const seed = NUDGE_LINES[Math.floor(Math.random() * NUDGE_LINES.length)];
     await speakText(state, seed);
     state.context.push({ role: "assistant", content: seed });
-  }, 3000);
-}
-
-async function speakText(state, text) {
-  try {
-    state.listening = false;
-    const pcm = await synthesizePcm16_8k(text);    // Google TTS PCM16 (8k)
-    const mulaw = encodePcm16ToMulaw(pcm);         // Convert to μ-law for Twilio
-    await sendMulawStream(state.ws, state.streamSid, mulaw);
-  } catch (e) {
-    console.warn("TTS/speak error:", e.stack || e.message);
-  } finally {
-    state.listening = true;
-    scheduleNudge(state);
-  }
+  }, delayMs);
 }
 
 async function finalizeTurn(state) {
@@ -406,7 +444,14 @@ wss.on("connection", (ws, req) => {
 
       state = makeState(ws, streamSid, callSid);
       console.log("📞 Stream started:", { streamSid, callSid });
-      scheduleNudge(state);
+
+      // Speak immediately: prewarmed greeting if available, else schedule 0ms nudge
+      if (BOOT_GREETING_MULAW) {
+        state.listening = true;
+        await sendMulawStream(state.ws, state.streamSid, BOOT_GREETING_MULAW);
+      } else {
+        scheduleNudge(state, 0);
+      }
     }
 
     else if (data.event === "media") {
@@ -434,6 +479,7 @@ wss.on("connection", (ws, req) => {
         if (state.nudgeTimer) { clearTimeout(state.nudgeTimer); state.nudgeTimer = null; }
       } else {
         state.silenceFrames++;
+        // ~12 frames ≈ 240ms of silence: end of user turn
         if (state.heardAnySpeech && state.silenceFrames >= 12) {
           state.heardAnySpeech = false;
           await finalizeTurn(state);

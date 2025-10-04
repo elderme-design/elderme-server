@@ -67,21 +67,16 @@ function decodeMulawToPcm16(muBuf) {
 }
 
 async function sendMulawStream(ws, streamSid, mulawBuf) {
-  const BYTES_PER_FRAME = 160;
+  const BYTES_PER_FRAME = 160; // 20ms at 8kHz μ-law
   for (let off = 0; off < mulawBuf.length; off += BYTES_PER_FRAME) {
     if (ws.readyState !== 1) break;
-    const frame = mulawBuf.subarray(
-      off,
-      Math.min(off + BYTES_PER_FRAME, mulawBuf.length)
-    );
-    ws.send(
-      JSON.stringify({
-        event: "media",
-        streamSid,
-        media: { payload: frame.toString("base64") },
-      })
-    );
-    await new Promise((r) => setTimeout(r, 20));
+    const frame = mulawBuf.subarray(off, Math.min(off + BYTES_PER_FRAME, mulawBuf.length));
+    ws.send(JSON.stringify({
+      event: "media",
+      streamSid,
+      media: { payload: frame.toString("base64") }
+    }));
+    await new Promise(r => setTimeout(r, 20));
   }
 }
 
@@ -180,9 +175,7 @@ async function transcribeWhisper(pcm16Buf) {
     });
     return (resp.text || "").trim();
   } finally {
-    try {
-      fs.unlinkSync(tmp);
-    } catch {}
+    try { fs.unlinkSync(tmp); } catch {}
   }
 }
 
@@ -216,17 +209,21 @@ app.get("/", (_req, res) =>
   res.send("ElderMe ✅ Twilio Media Streams + ElevenLabs TTS + Conversational loop")
 );
 
-/* ========= FIXED INBOUND CALL ========= */
+/* ========= INBOUND CALL (fixed Parameter) ========= */
 app.all("/voice", (req, res) => {
   console.log("✓ /voice hit. CallSid:", req.body.CallSid, "From:", req.body.From);
   const vr = new twilio.twiml.VoiceResponse();
+
   const connect = vr.connect();
   const stream = connect.stream({ url: `${PUBLIC_WS}/media` });
-  stream.parameter({ name: "callSid", value: req.body.CallSid || "" }); // ✅ FIXED
+
+  // ✅ Correct way to add <Parameter> (avoid "[object Object]")
+  stream.parameter({ name: "callSid", value: req.body.CallSid || "" });
+
   res.type("text/xml").send(vr.toString());
 });
 
-/* ========= OUTBOUND ========= */
+/* ========= OUTBOUND CALL (points to /voice) ========= */
 app.post("/call-me", async (req, res) => {
   try {
     if (CALL_ME_SECRET && req.body.secret !== CALL_ME_SECRET)
@@ -249,15 +246,13 @@ app.post("/call-me", async (req, res) => {
   }
 });
 
-/* ========= WS LOOP ========= */
+/* ========= WEBSOCKET /media: full convo loop ========= */
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: "/media" });
 
 function makeState(ws, streamSid, callSid) {
   return {
-    ws,
-    streamSid,
-    callSid,
+    ws, streamSid, callSid,
     listening: true,
     heardAnySpeech: false,
     pcmBuffer: [],
@@ -282,6 +277,8 @@ async function speakText(state, text) {
     state.listening = false;
     const mulaw = await synthesizeMulaw8k(text);
     await sendMulawStream(state.ws, state.streamSid, mulaw);
+  } catch (e) {
+    console.warn("TTS/speak error:", e.stack || e.message);
   } finally {
     state.listening = true;
     scheduleNudge(state);
@@ -290,22 +287,30 @@ async function speakText(state, text) {
 
 async function finalizeTurn(state) {
   if (state.pcmBuffer.length === 0) return;
+
   const pcm = Buffer.concat(state.pcmBuffer);
   state.pcmBuffer = [];
   state.silenceFrames = 0;
+
   let text = "";
   try {
     text = await transcribeWhisper(pcm);
-  } catch {}
+  } catch (e) {
+    console.error("STT error:", e);
+  }
   if (!text) return;
+
   state.context.push({ role: "user", content: text });
+
   let reply = "";
   try {
     reply = await chatReply(state.context, text);
-  } catch {
+  } catch (e) {
+    console.error("Chat error:", e);
     reply = "I’m here with you. Tell me more about that.";
   }
   state.context.push({ role: "assistant", content: reply });
+
   await speakText(state, reply);
 }
 
@@ -313,28 +318,36 @@ wss.on("connection", (ws) => {
   let streamSid = null;
   let callSid = null;
   let state = null;
+
   ws.on("message", async (buf) => {
     let data;
-    try {
-      data = JSON.parse(buf.toString());
-    } catch {
-      return;
-    }
+    try { data = JSON.parse(buf.toString()); } catch { return; }
+
     if (data.event === "start") {
       streamSid = data.start.streamSid;
-      const params = (data.start.customParameters || []).reduce((acc, p) => {
-        acc[p.name] = p.value;
-        return acc;
-      }, {});
+
+      // ✅ FIX: Twilio sends customParameters as an object
+      const params =
+        (data.start && typeof data.start.customParameters === "object" && data.start.customParameters)
+          ? data.start.customParameters
+          : {};
+
       callSid = params.callSid || null;
+
       state = makeState(ws, streamSid, callSid);
+      console.log("📞 Stream started:", { streamSid, callSid });
       scheduleNudge(state);
-    } else if (data.event === "media") {
+    }
+
+    else if (data.event === "media") {
       if (!state) return;
       const mu = Buffer.from(data.media.payload, "base64");
       if (!state.listening) return;
+
       const pcm = decodeMulawToPcm16(mu);
       state.pcmBuffer.push(pcm);
+
+      // simple VAD: RMS on PCM16
       let rms = 0;
       for (let i = 0; i < pcm.length; i += 2) {
         const s = pcm.readInt16LE(i) / 32768;
@@ -343,13 +356,11 @@ wss.on("connection", (ws) => {
       rms = Math.sqrt(rms / (pcm.length / 2));
       const SPEECH_THRESH = 0.015;
       const isSpeech = rms > SPEECH_THRESH;
+
       if (isSpeech) {
         state.heardAnySpeech = true;
         state.silenceFrames = 0;
-        if (state.nudgeTimer) {
-          clearTimeout(state.nudgeTimer);
-          state.nudgeTimer = null;
-        }
+        if (state.nudgeTimer) { clearTimeout(state.nudgeTimer); state.nudgeTimer = null; }
       } else {
         state.silenceFrames++;
         if (state.heardAnySpeech && state.silenceFrames >= 12) {
@@ -357,7 +368,10 @@ wss.on("connection", (ws) => {
           await finalizeTurn(state);
         }
       }
-    } else if (data.event === "stop") {
+    }
+
+    else if (data.event === "stop") {
+      console.log("🛑 Stream stopped:", { streamSid, callSid });
       if (state?.nudgeTimer) clearTimeout(state.nudgeTimer);
       state = null;
     }

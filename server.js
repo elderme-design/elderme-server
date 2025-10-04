@@ -21,21 +21,17 @@ const TWILIO_NUMBER =
   process.env.TWILIO_FROM_NUMBER || process.env.TWILIO_PHONE_NUMBER;
 const CALL_ME_SECRET = process.env.CALL_ME_SECRET || "changeme";
 
-const PUBLIC_URL =
-  process.env.PUBLIC_URL || "https://elderme-server.onrender.com";
-const PUBLIC_WS =
-  process.env.PUBLIC_WS || PUBLIC_URL.replace(/^http(s?):\/\//, "wss://");
+const PUBLIC_URL = process.env.PUBLIC_URL || "https://elderme-server.onrender.com";
+const PUBLIC_WS = process.env.PUBLIC_WS || PUBLIC_URL.replace(/^http(s?):\/\//, "wss://");
 
 // Google TTS voice (change if you like)
 const GOOGLE_TTS_VOICE = process.env.GOOGLE_TTS_VOICE || "en-US-Wavenet-D";
 
 // sanity logs
 if (!OPENAI_API_KEY) console.warn("⚠️ OPENAI_API_KEY not set");
-if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN)
-  console.warn("⚠️ TWILIO SID/TOKEN not set");
+if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) console.warn("⚠️ TWILIO SID/TOKEN not set");
 if (!TWILIO_NUMBER) console.warn("⚠️ TWILIO_PHONE_NUMBER not set");
-if (!process.env.GOOGLE_TTS_KEY)
-  console.warn("⚠️ GOOGLE_TTS_KEY not set — Google TTS will fail");
+if (!process.env.GOOGLE_TTS_KEY) console.warn("⚠️ GOOGLE_TTS_KEY not set — Google TTS will fail");
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -106,7 +102,7 @@ function encodePcm16ToMulaw(pcm16Buf) {
   return out;
 }
 
-// stream μ-law back to Twilio in 20ms frames (8kHz -> 160 bytes/frame)
+// Stream μ-law back to Twilio in 20ms frames (8kHz -> 160 bytes/frame)
 async function sendMulawStream(ws, streamSid, mulawBuf) {
   const BYTES_PER_FRAME = 160;
   for (let off = 0; off < mulawBuf.length; off += BYTES_PER_FRAME) {
@@ -154,9 +150,9 @@ async function synthesizePcm16_8k(text) {
   const [resp] = await googleTTS.synthesizeSpeech({
     input: { text },
     voice: {
-      languageCode: GOOGLE_TTS_VOICE.slice(0, 5), // e.g. en-US
+      languageCode: GOOGLE_TTS_VOICE.slice(0, 5), // e.g., en-US
       name: GOOGLE_TTS_VOICE,
-      ssmlGender: "MALE",
+      ssmlGender: "NEUTRAL",
     },
     audioConfig: { audioEncoding: "LINEAR16", sampleRateHertz: 8000 },
   });
@@ -177,7 +173,7 @@ app.get("/tts", async (req, res) => {
   }
 });
 
-/* ========= OpenAI ========= */
+/* ========= OpenAI (Whisper) ========= */
 async function transcribeWhisper(pcm16Buf) {
   const wav = pcm16ToWav8kMono(pcm16Buf);
   const tmp = path.join(AUDIO_DIR, `chunk_${Date.now()}.wav`);
@@ -214,7 +210,7 @@ async function chatReply(contextMessages, userText) {
   });
   return (
     (r.choices?.[0]?.message?.content || "").trim() ||
-    "Rashid, I know you, your dad Mirza, your son Sarem?"
+    "I’m here with you. Tell me more about that."
   );
 }
 
@@ -249,11 +245,9 @@ app.post("/call-me", async (req, res) => {
       from: TWILIO_NUMBER,
       url: `${PUBLIC_URL}/voice`,
       method: "POST",
-      // ↓↓↓ helps us see why the outbound failed/busy/etc.
       statusCallback: `${PUBLIC_URL}/twilio-status`,
       statusCallbackMethod: "POST",
       statusCallbackEvent: ["initiated", "ringing", "answered", "completed"],
-      // Optional: connect audio only after callee answers (sometimes helps with spam filters)
       answerOnBridge: true,
     });
 
@@ -261,6 +255,19 @@ app.post("/call-me", async (req, res) => {
   } catch (e) {
     console.error("call-me error:", e);
     res.status(500).json({ error: "Failed to place call" });
+  }
+});
+
+/* ========= Hangup helper ========= */
+app.post("/hangup", async (req, res) => {
+  try {
+    const { callSid } = req.body || {};
+    if (!callSid) return res.status(400).json({ error: "Missing callSid" });
+    const updated = await twilioClient.calls(callSid).update({ status: "completed" });
+    res.json({ ok: true, callSid: updated.sid, status: updated.status });
+  } catch (e) {
+    console.error("hangup error:", e);
+    res.status(500).json({ error: "Failed to hang up" });
   }
 });
 
@@ -295,6 +302,13 @@ app.post("/twilio-status", (req, res) => {
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: "/media" });
 
+// Rotateable nudge lines — edit these to change the opening prompt.
+const NUDGE_LINES = [
+  "Hey Rashid, your daughter Cyma told me to call.",
+  "Do you still work with Haroon Shaikh?",
+  "What’s on your mind right now?",
+];
+
 function makeState(ws, streamSid, callSid) {
   return {
     ws, streamSid, callSid,
@@ -311,8 +325,7 @@ function scheduleNudge(state) {
   if (state.nudgeTimer) clearTimeout(state.nudgeTimer);
   state.nudgeTimer = setTimeout(async () => {
     if (!state || !state.listening) return;
-    const seed =
-      "Hey Rashid, was your dad Mirza? ";
+    const seed = NUDGE_LINES[Math.floor(Math.random() * NUDGE_LINES.length)];
     await speakText(state, seed);
     state.context.push({ role: "assistant", content: seed });
   }, 3000);
@@ -363,7 +376,18 @@ async function finalizeTurn(state) {
   await speakText(state, reply);
 }
 
-wss.on("connection", (ws) => {
+wss.on("connection", (ws, req) => {
+  const ip = req.headers["x-forwarded-for"] || req.socket.remoteAddress;
+  console.log("WS connection from", ip);
+
+  ws.on("error", (e) => console.error("WS client error:", e));
+
+  // keepalive (optional)
+  const ka = setInterval(() => {
+    if (ws.readyState === 1) ws.ping();
+  }, 15000);
+  ws.on("close", () => clearInterval(ka));
+
   let streamSid = null;
   let callSid = null;
   let state = null;
@@ -412,3 +436,21 @@ wss.on("connection", (ws) => {
         state.silenceFrames++;
         if (state.heardAnySpeech && state.silenceFrames >= 12) {
           state.heardAnySpeech = false;
+          await finalizeTurn(state);
+        }
+      }
+    }
+
+    else if (data.event === "stop") {
+      console.log("🛑 Stream stopped:", { streamSid, callSid });
+      if (state?.nudgeTimer) clearTimeout(state.nudgeTimer);
+      state = null;
+    }
+  });
+});
+
+/* ========= START SERVER ========= */
+const port = process.env.PORT || 3000;
+server.listen(port, () => {
+  console.log(`Listening on ${port} • WS ${PUBLIC_WS}/media`);
+});

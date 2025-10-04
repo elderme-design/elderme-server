@@ -234,7 +234,7 @@ app.all("/voice", (req, res) => {
   res.type("text/xml").send(vr.toString());
 });
 
-/* ========= OUTBOUND CALL ========= */
+/* ========= OUTBOUND CALL (with StatusCallback) ========= */
 app.post("/call-me", async (req, res) => {
   try {
     if (CALL_ME_SECRET && req.body.secret !== CALL_ME_SECRET)
@@ -249,12 +249,46 @@ app.post("/call-me", async (req, res) => {
       from: TWILIO_NUMBER,
       url: `${PUBLIC_URL}/voice`,
       method: "POST",
+      // ↓↓↓ helps us see why the outbound failed/busy/etc.
+      statusCallback: `${PUBLIC_URL}/twilio-status`,
+      statusCallbackMethod: "POST",
+      statusCallbackEvent: ["initiated", "ringing", "answered", "completed"],
+      // Optional: connect audio only after callee answers (sometimes helps with spam filters)
+      answerOnBridge: true,
     });
+
     res.json({ ok: true, sid: call.sid });
   } catch (e) {
     console.error("call-me error:", e);
     res.status(500).json({ error: "Failed to place call" });
   }
+});
+
+/* ========= Twilio Status Callback (debug outbound results) ========= */
+app.post("/twilio-status", (req, res) => {
+  const {
+    CallSid,
+    CallStatus,
+    To,
+    From,
+    SipResponseCode,
+    ErrorCode,
+    Timestamp,
+    SequenceNumber,
+    ApiVersion,
+  } = req.body || {};
+  console.log("Twilio status:", {
+    CallSid,
+    CallStatus,
+    SipResponseCode,
+    ErrorCode,
+    To,
+    From,
+    Timestamp,
+    SequenceNumber,
+    ApiVersion,
+  });
+  res.sendStatus(204);
 });
 
 /* ========= WEBSOCKET /media ========= */
@@ -378,21 +412,3 @@ wss.on("connection", (ws) => {
         state.silenceFrames++;
         if (state.heardAnySpeech && state.silenceFrames >= 12) {
           state.heardAnySpeech = false;
-          await finalizeTurn(state);
-        }
-      }
-    }
-
-    else if (data.event === "stop") {
-      console.log("🛑 Stream stopped:", { streamSid, callSid });
-      if (state?.nudgeTimer) clearTimeout(state.nudgeTimer);
-      state = null;
-    }
-  });
-});
-
-/* ========= START SERVER ========= */
-const port = process.env.PORT || 3000;
-server.listen(port, () => {
-  console.log(`Listening on ${port} • WS ${PUBLIC_WS}/media`);
-});

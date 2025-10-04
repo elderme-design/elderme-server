@@ -22,8 +22,7 @@ const TWILIO_NUMBER =
 const CALL_ME_SECRET = process.env.CALL_ME_SECRET || "changeme";
 
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
-const ELEVENLABS_VOICE_ID =
-  process.env.ELEVENLABS_VOICE_ID || "kHhWB9Fw3aF6ly7JvltC";
+const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID; // e.g. kHhWB9Fw3aF6ly7JvltC
 
 const PUBLIC_URL =
   process.env.PUBLIC_URL || "https://elderme-server.onrender.com";
@@ -110,9 +109,41 @@ function pcm16ToWav8kMono(pcm) {
   return buf;
 }
 
-/* ---- ElevenLabs TTS -> μ-law 8k ----
-   We ask ElevenLabs for "ulaw_8000" so we can send it straight to Twilio.
-*/
+/* ---- ElevenLabs TTS ---- */
+
+// MP3 endpoint for quick tests / Twilio <Play>
+app.get("/tts", async (req, res) => {
+  try {
+    const text = req.query.text || "Hello, this is ElderMe with ElevenLabs.";
+    const r = await fetch(
+      `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}/stream`,
+      {
+        method: "POST",
+        headers: {
+          "xi-api-key": ELEVENLABS_API_KEY,
+          "Content-Type": "application/json",
+          "Accept": "audio/mpeg",
+        },
+        body: JSON.stringify({
+          text,
+          model_id: "eleven_multilingual_v2",
+          output_format: "mp3_22050",
+          voice_settings: { stability: 0.35, similarity_boost: 0.7 },
+        }),
+      }
+    );
+    if (!r.ok) {
+      const msg = await r.text();
+      return res.status(500).send(`ElevenLabs error: ${msg}`);
+    }
+    res.setHeader("Content-Type", "audio/mpeg");
+    r.body.pipe(res);
+  } catch (e) {
+    res.status(500).send(`TTS failed: ${e.message}`);
+  }
+});
+
+// Get μ-law 8k from ElevenLabs for streaming back to Twilio via WS
 async function synthesizeMulaw8k(text) {
   if (!ELEVENLABS_API_KEY || !ELEVENLABS_VOICE_ID) {
     throw new Error("ElevenLabs not configured");
@@ -125,16 +156,14 @@ async function synthesizeMulaw8k(text) {
       headers: {
         "xi-api-key": ELEVENLABS_API_KEY,
         "Content-Type": "application/json",
-        "Accept": "audio/ulaw"
+        "Accept": "audio/ulaw",
       },
       body: JSON.stringify({
         text,
-        // model you have access to; "eleven_multilingual_v2" is widely available
         model_id: "eleven_multilingual_v2",
-        // ask for μ-law 8k output so we can stream directly to Twilio
-        output_format: "ulaw_8000",
-        voice_settings: { stability: 0.35, similarity_boost: 0.7 }
-      })
+        output_format: "ulaw_8000", // Twilio-ready
+        voice_settings: { stability: 0.35, similarity_boost: 0.7 },
+      }),
     }
   );
 
@@ -143,7 +172,6 @@ async function synthesizeMulaw8k(text) {
     throw new Error(`ElevenLabs error: ${msg}`);
   }
 
-  // Collect streamed body into a single Buffer
   const chunks = [];
   for await (const chunk of r.body) chunks.push(chunk);
   return Buffer.concat(chunks);
@@ -157,7 +185,7 @@ async function transcribeWhisper(pcm16Buf) {
   try {
     const resp = await openai.audio.transcriptions.create({
       file: fs.createReadStream(tmp),
-      model: "whisper-1"
+      model: "whisper-1",
     });
     return (resp.text || "").trim();
   } finally {
@@ -176,13 +204,13 @@ async function chatReply(contextMessages, userText) {
   const messages = [
     { role: "system", content: buildSystemPrompt() },
     ...contextMessages,
-    { role: "user", content: userText }
+    { role: "user", content: userText },
   ];
   const r = await openai.chat.completions.create({
     model: "gpt-4o-mini",
     messages,
     temperature: 0.7,
-    max_tokens: 180
+    max_tokens: 180,
   });
   const text =
     (r.choices?.[0]?.message?.content || "").trim() ||
@@ -191,17 +219,28 @@ async function chatReply(contextMessages, userText) {
 }
 
 /* ========= HEALTH ========= */
-app.get("/", (_req, res) => res.send("ElderMe ✅ Media Streams + ElevenLabs TTS + Conversational loop"));
+app.get("/", (_req, res) =>
+  res.send("ElderMe ✅ Twilio Media Streams + ElevenLabs TTS + Conversational loop")
+);
 
-/* ========= INBOUND CALL: start media stream ========= */
+/* ========= INBOUND CALL: greet with ElevenLabs, then start stream ========= */
 app.post("/voice", async (req, res) => {
+  console.log("✓ /voice hit. CallSid:", req.body.CallSid, "From:", req.body.From);
+
   const vr = new twilio.twiml.VoiceResponse();
-  vr.say({ voice: "Polly.Matthew", language: "en-US" }, "Hi, it's ElderMe.");
+
+  // Play your ElevenLabs voice immediately so caller hears the brand voice
+  vr.play({}, `${PUBLIC_URL}/tts?text=${encodeURIComponent(
+    "Hi, this is ElderMe in my real voice. Give me a second while I get set up."
+  )}`);
+
+  // Then open the WebSocket for live audio (conversational loop)
   const connect = vr.connect();
   connect.stream({
     url: `${PUBLIC_WS}/media`,
     parameter: [{ name: "callSid", value: req.body.CallSid || "" }],
   });
+
   res.type("text/xml").send(vr.toString());
 });
 
@@ -232,21 +271,21 @@ app.post("/call-me", async (req, res) => {
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: "/media" });
 
-// Toggle to echo caller audio for debugging
-const LOOPBACK_TEST = false;
+// Optional keepalive + logging
+server.on("error", (e) => console.error("HTTP server error:", e));
+wss.on("error", (e) => console.error("WSS error:", e));
 
-// Per-call state
-const calls = new Map(); // streamSid => { ... }
+const LOOPBACK_TEST = false;
 
 function makeState(ws, streamSid, callSid) {
   return {
     ws, streamSid, callSid,
-    listening: true,          // if false, we're speaking back
+    listening: true,
     heardAnySpeech: false,
-    pcmBuffer: [],            // array of PCM16 Buffers (per frame)
+    pcmBuffer: [],
     silenceFrames: 0,
-    context: [],              // chat history (assistant/user messages)
-    nudgeTimer: null
+    context: [],
+    nudgeTimer: null,
   };
 }
 
@@ -254,7 +293,8 @@ function scheduleNudge(state) {
   if (state.nudgeTimer) clearTimeout(state.nudgeTimer);
   state.nudgeTimer = setTimeout(async () => {
     if (!state || !state.listening) return;
-    const seed = "Well, life's good. I just called to check in. What did you eat this morning?";
+    const seed =
+      "Well, life's good. I just called to check in. What did you eat this morning?";
     await speakText(state, seed);
     state.context.push({ role: "assistant", content: seed });
   }, 3000);
@@ -263,11 +303,12 @@ function scheduleNudge(state) {
 async function speakText(state, text) {
   try {
     state.listening = false;
-    // Get μ-law 8k audio from ElevenLabs and stream to Twilio
-    const mulaw = await synthesizeMulaw8k(text);
+    console.log("TTS ->", text);
+    const mulaw = await synthesizeMulaw8k(text);   // ElevenLabs μ-law 8k
     await sendMulawStream(state.ws, state.streamSid, mulaw);
+    console.log("TTS streamed", mulaw.length, "bytes");
   } catch (e) {
-    console.warn("TTS/speak error:", e.message);
+    console.warn("TTS/speak error:", e.stack || e.message);
   } finally {
     state.listening = true;
     scheduleNudge(state);
@@ -277,7 +318,6 @@ async function speakText(state, text) {
 async function finalizeTurn(state) {
   if (state.pcmBuffer.length === 0) return;
 
-  // concat audio
   const pcm = Buffer.concat(state.pcmBuffer);
   state.pcmBuffer = [];
   state.silenceFrames = 0;
@@ -303,11 +343,22 @@ async function finalizeTurn(state) {
   }
   state.context.push({ role: "assistant", content: reply });
 
-  // TTS -> stream back
   await speakText(state, reply);
 }
 
-wss.on("connection", (ws) => {
+wss.on("connection", (ws, req) => {
+  console.log(
+    "WS connection from",
+    req.headers["x-forwarded-for"] || req.socket.remoteAddress
+  );
+
+  ws.on("error", (e) => console.error("WS client error:", e));
+
+  const ka = setInterval(() => {
+    if (ws.readyState === 1) ws.ping();
+  }, 15000);
+  ws.on("close", () => clearInterval(ka));
+
   let streamSid = null;
   let callSid = null;
   let state = null;
@@ -325,7 +376,6 @@ wss.on("connection", (ws) => {
       callSid = params.callSid || null;
 
       state = makeState(ws, streamSid, callSid);
-      calls.set(streamSid, state);
       console.log("📞 Stream started:", { streamSid, callSid });
       scheduleNudge(state);
     }
@@ -334,12 +384,10 @@ wss.on("connection", (ws) => {
       if (!state) return;
       const mu = Buffer.from(data.media.payload, "base64");
 
-      // quick echo test
       if (LOOPBACK_TEST && ws.readyState === 1) {
         ws.send(JSON.stringify({ event: "media", streamSid, media: { payload: mu.toString("base64") } }));
       }
 
-      // If we are "speaking", ignore incoming frames to avoid barge-in
       if (!state.listening) return;
 
       // decode to PCM16 for VAD + STT
@@ -354,7 +402,7 @@ wss.on("connection", (ws) => {
       }
       rms = Math.sqrt(rms / (pcm.length / 2));
 
-      const SPEECH_THRESH = 0.015; // ~-36 dBFS, tweak as needed
+      const SPEECH_THRESH = 0.015; // tweak as needed
       const isSpeech = rms > SPEECH_THRESH;
 
       if (isSpeech) {
@@ -374,15 +422,8 @@ wss.on("connection", (ws) => {
     else if (data.event === "stop") {
       console.log("🛑 Stream stopped:", { streamSid, callSid });
       if (state?.nudgeTimer) clearTimeout(state.nudgeTimer);
-      calls.delete(streamSid);
       state = null;
     }
-  });
-
-  ws.on("close", () => {
-    if (state?.nudgeTimer) clearTimeout(state.nudgeTimer);
-    if (streamSid) calls.delete(streamSid);
-    console.log("WS closed", { streamSid, callSid });
   });
 });
 

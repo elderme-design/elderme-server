@@ -10,7 +10,7 @@ import { WebSocketServer } from "ws";
 import fetch from "node-fetch";
 
 const app = express();
-app.use(express.urlencoded({ extended: true }));
+app.use(express.urlencoded({ extended: true })); // Twilio sends x-www-form-urlencoded
 app.use(express.json());
 
 /* ========= ENV + CLIENTS ========= */
@@ -24,14 +24,12 @@ const CALL_ME_SECRET = process.env.CALL_ME_SECRET || "changeme";
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
 const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID; // e.g. kHhWB9Fw3aF6ly7JvltC
 
-const PUBLIC_URL =
-  process.env.PUBLIC_URL || "https://elderme-server.onrender.com";
-const PUBLIC_WS =
-  process.env.PUBLIC_WS || PUBLIC_URL.replace(/^http(s?):\/\//, "wss://");
+const PUBLIC_URL = process.env.PUBLIC_URL || "https://elderme-server.onrender.com";
+const PUBLIC_WS = process.env.PUBLIC_WS || PUBLIC_URL.replace(/^http(s?):\/\//, "wss://");
 
+// sanity logs (won’t crash app)
 if (!OPENAI_API_KEY) console.warn("⚠️ OPENAI_API_KEY not set");
-if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN)
-  console.warn("⚠️ TWILIO SID/TOKEN not set");
+if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) console.warn("⚠️ TWILIO SID/TOKEN not set");
 if (!TWILIO_NUMBER) console.warn("⚠️ TWILIO_PHONE_NUMBER not set");
 if (!ELEVENLABS_API_KEY) console.warn("⚠️ ELEVENLABS_API_KEY not set");
 if (!ELEVENLABS_VOICE_ID) console.warn("⚠️ ELEVENLABS_VOICE_ID not set");
@@ -122,7 +120,7 @@ app.get("/tts", async (req, res) => {
         headers: {
           "xi-api-key": ELEVENLABS_API_KEY,
           "Content-Type": "application/json",
-          "Accept": "audio/mpeg",
+          // Avoid being strict about Accept to prevent content-type mismatches
         },
         body: JSON.stringify({
           text,
@@ -134,11 +132,13 @@ app.get("/tts", async (req, res) => {
     );
     if (!r.ok) {
       const msg = await r.text();
+      console.error("ElevenLabs /tts error:", msg);
       return res.status(500).send(`ElevenLabs error: ${msg}`);
     }
     res.setHeader("Content-Type", "audio/mpeg");
     r.body.pipe(res);
   } catch (e) {
+    console.error("TTS /tts failed:", e);
     res.status(500).send(`TTS failed: ${e.message}`);
   }
 });
@@ -156,7 +156,7 @@ async function synthesizeMulaw8k(text) {
       headers: {
         "xi-api-key": ELEVENLABS_API_KEY,
         "Content-Type": "application/json",
-        "Accept": "audio/ulaw",
+        // Don't force Accept—let server decide
       },
       body: JSON.stringify({
         text,
@@ -223,24 +223,18 @@ app.get("/", (_req, res) =>
   res.send("ElderMe ✅ Twilio Media Streams + ElevenLabs TTS + Conversational loop")
 );
 
-/* ========= INBOUND CALL: greet with ElevenLabs, then start stream ========= */
-app.post("/voice", async (req, res) => {
+/* ========= INBOUND CALL: minimal & reliable stream =========
+   Keep this simple while we debug—no <Play> first.
+   Once confirmed, you can add: vr.play(`${PUBLIC_URL}/tts?...`) before connect.stream.
+*/
+app.all("/voice", (req, res) => {
   console.log("✓ /voice hit. CallSid:", req.body.CallSid, "From:", req.body.From);
-
   const vr = new twilio.twiml.VoiceResponse();
-
-  // Play your ElevenLabs voice immediately so caller hears the brand voice
-  vr.play({}, `${PUBLIC_URL}/tts?text=${encodeURIComponent(
-    "Hi, this is ElderMe in my real voice. Give me a second while I get set up."
-  )}`);
-
-  // Then open the WebSocket for live audio (conversational loop)
   const connect = vr.connect();
   connect.stream({
     url: `${PUBLIC_WS}/media`,
     parameter: [{ name: "callSid", value: req.body.CallSid || "" }],
   });
-
   res.type("text/xml").send(vr.toString());
 });
 
@@ -271,7 +265,7 @@ app.post("/call-me", async (req, res) => {
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: "/media" });
 
-// Optional keepalive + logging
+// Extra logging
 server.on("error", (e) => console.error("HTTP server error:", e));
 wss.on("error", (e) => console.error("WSS error:", e));
 
@@ -347,13 +341,10 @@ async function finalizeTurn(state) {
 }
 
 wss.on("connection", (ws, req) => {
-  console.log(
-    "WS connection from",
-    req.headers["x-forwarded-for"] || req.socket.remoteAddress
-  );
-
+  console.log("WS connection from", req.headers["x-forwarded-for"] || req.socket.remoteAddress);
   ws.on("error", (e) => console.error("WS client error:", e));
 
+  // keepalive (optional)
   const ka = setInterval(() => {
     if (ws.readyState === 1) ws.ping();
   }, 15000);

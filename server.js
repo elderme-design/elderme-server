@@ -138,7 +138,7 @@ app.post("/voice", async (req, res) => {
   const vr = new twilio.twiml.VoiceResponse();
 
   // Tiny greeting so caller knows they’re connected (keep it short)
-  vr.say({ voice: "Polly.Matthew", language: "en-US" }, "Hey, what's hope. Um hope you're goood, it's ElderMe. I wanted to give you a quick, um, call to check in. How are you?");
+  vr.say({ voice: "Polly.Matthew", language: "en-US" }, "Hey, what's going on. I hope you're goood, it's ElderMe. I wanted to give youa quick call to check in. How are you?");
 
   // Start bidirectional media stream to our WebSocket
   const connect = vr.connect();
@@ -252,3 +252,4 @@ const port = process.env.PORT || 3000;
 server.listen(port, () =>
   console.log(`Listening on ${port} • WS ${PUBLIC_WS}/media`)
 );
+

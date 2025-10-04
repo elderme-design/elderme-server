@@ -7,7 +7,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 import http from "http";
 import { WebSocketServer } from "ws";
-import fetch from "node-fetch";
+import { TextToSpeechClient } from "@google-cloud/text-to-speech";
 
 const app = express();
 app.use(express.urlencoded({ extended: true })); // Twilio sends x-www-form-urlencoded
@@ -21,21 +21,21 @@ const TWILIO_NUMBER =
   process.env.TWILIO_FROM_NUMBER || process.env.TWILIO_PHONE_NUMBER;
 const CALL_ME_SECRET = process.env.CALL_ME_SECRET || "changeme";
 
-const ELEVENLABS_API_KEY = (process.env.ELEVENLABS_API_KEY || "").trim();
-const ELEVENLABS_VOICE_ID = (process.env.ELEVENLABS_VOICE_ID || "").trim();
-
 const PUBLIC_URL =
   process.env.PUBLIC_URL || "https://elderme-server.onrender.com";
 const PUBLIC_WS =
   process.env.PUBLIC_WS || PUBLIC_URL.replace(/^http(s?):\/\//, "wss://");
+
+// Google TTS voice (change if you like)
+const GOOGLE_TTS_VOICE = process.env.GOOGLE_TTS_VOICE || "en-US-Wavenet-D";
 
 // sanity logs
 if (!OPENAI_API_KEY) console.warn("⚠️ OPENAI_API_KEY not set");
 if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN)
   console.warn("⚠️ TWILIO SID/TOKEN not set");
 if (!TWILIO_NUMBER) console.warn("⚠️ TWILIO_PHONE_NUMBER not set");
-if (!ELEVENLABS_API_KEY) console.warn("⚠️ ELEVENLABS_API_KEY not set");
-if (!ELEVENLABS_VOICE_ID) console.warn("⚠️ ELEVENLABS_VOICE_ID not set");
+if (!process.env.GOOGLE_TTS_KEY)
+  console.warn("⚠️ GOOGLE_TTS_KEY not set — Google TTS will fail");
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -48,12 +48,27 @@ const AUDIO_DIR = path.join(__dirname, "audio");
 if (!fs.existsSync(AUDIO_DIR)) fs.mkdirSync(AUDIO_DIR);
 app.use("/audio", express.static(AUDIO_DIR));
 
+/* ========= Google TTS setup ========= */
+let googleReady = false;
+try {
+  if (process.env.GOOGLE_TTS_KEY) {
+    const keyPath = path.join(__dirname, "google-tts.json");
+    fs.writeFileSync(keyPath, process.env.GOOGLE_TTS_KEY);
+    process.env.GOOGLE_APPLICATION_CREDENTIALS = keyPath;
+    googleReady = true;
+  }
+} catch (e) {
+  console.warn("⚠️ Failed to write GOOGLE_TTS_KEY file:", e);
+}
+const googleTTS = new TextToSpeechClient();
+
 /* ========= HELPERS ========= */
 function toE164(num) {
   const s = String(num || "").replace(/[^\d+]/g, "");
   return s.startsWith("+") ? s : `+${s}`;
 }
 
+// μ-law decode (G.711) -> PCM16 LE
 function decodeMulawToPcm16(muBuf) {
   const out = Buffer.alloc(muBuf.length * 2);
   for (let i = 0; i < muBuf.length; i++) {
@@ -66,8 +81,34 @@ function decodeMulawToPcm16(muBuf) {
   return out;
 }
 
+// PCM16 LE -> μ-law byte
+function pcm16ToMulawSample(sample) {
+  const BIAS = 0x84;
+  let sign = (sample >> 8) & 0x80;
+  if (sign !== 0) sample = -sample;
+  if (sample > 32635) sample = 32635;
+  sample = sample + BIAS;
+  let exponent = 7;
+  for (let expMask = 0x4000; (sample & expMask) === 0 && exponent > 0; exponent--, expMask >>= 1) {}
+  const mantissa = (sample >> ((exponent === 0) ? 4 : (exponent + 3))) & 0x0f;
+  let ulaw = ~(sign | (exponent << 4) | mantissa);
+  return ulaw & 0xff;
+}
+
+// PCM16 LE Buffer -> μ-law Buffer
+function encodePcm16ToMulaw(pcm16Buf) {
+  const samples = pcm16Buf.length / 2;
+  const out = Buffer.alloc(samples);
+  for (let i = 0; i < samples; i++) {
+    const sample = pcm16Buf.readInt16LE(i * 2);
+    out[i] = pcm16ToMulawSample(sample);
+  }
+  return out;
+}
+
+// stream μ-law back to Twilio in 20ms frames (8kHz -> 160 bytes/frame)
 async function sendMulawStream(ws, streamSid, mulawBuf) {
-  const BYTES_PER_FRAME = 160; // 20ms at 8kHz μ-law
+  const BYTES_PER_FRAME = 160;
   for (let off = 0; off < mulawBuf.length; off += BYTES_PER_FRAME) {
     if (ws.readyState !== 1) break;
     const frame = mulawBuf.subarray(off, Math.min(off + BYTES_PER_FRAME, mulawBuf.length));
@@ -80,9 +121,10 @@ async function sendMulawStream(ws, streamSid, mulawBuf) {
   }
 }
 
+// Minimal WAV (8kHz mono, PCM16) — handy for temp files / /tts
 function pcm16ToWav8kMono(pcm) {
   const sampleRate = 8000;
-  const byteRate = sampleRate * 2;
+  const byteRate = sampleRate * 2; // 16-bit mono
   const blockAlign = 2;
   const bitsPerSample = 16;
   const dataSize = pcm.length;
@@ -96,7 +138,7 @@ function pcm16ToWav8kMono(pcm) {
   buf.writeUInt32LE(16, 16);
   buf.writeUInt16LE(1, 20);
   buf.writeUInt16LE(1, 22);
-  buf.writeUInt32LE(8000, 24);
+  buf.writeUInt32LE(sampleRate, 24);
   buf.writeUInt32LE(byteRate, 28);
   buf.writeUInt16LE(blockAlign, 32);
   buf.writeUInt16LE(bitsPerSample, 34);
@@ -106,64 +148,34 @@ function pcm16ToWav8kMono(pcm) {
   return buf;
 }
 
-/* ========= ElevenLabs ========= */
+/* ========= Google TTS (8kHz PCM16) ========= */
+async function synthesizePcm16_8k(text) {
+  if (!googleReady) throw new Error("Google TTS not configured (GOOGLE_TTS_KEY)");
+  const [resp] = await googleTTS.synthesizeSpeech({
+    input: { text },
+    voice: {
+      languageCode: GOOGLE_TTS_VOICE.slice(0, 5), // e.g. en-US
+      name: GOOGLE_TTS_VOICE,
+      ssmlGender: "MALE",
+    },
+    audioConfig: { audioEncoding: "LINEAR16", sampleRateHertz: 8000 },
+  });
+  return Buffer.from(resp.audioContent);
+}
+
+/* ========= /tts demo (returns WAV) ========= */
 app.get("/tts", async (req, res) => {
   try {
-    const text = req.query.text || "Hello, this is ElderMe with ElevenLabs.";
-    const r = await fetch(
-      `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}/stream`,
-      {
-        method: "POST",
-        headers: {
-          "xi-api-key": ELEVENLABS_API_KEY,
-          "Content-Type": "application/json",
-          "Accept": "audio/mpeg",
-        },
-        body: JSON.stringify({
-          text,
-          model_id: "eleven_multilingual_v2",
-          output_format: "mp3_22050",
-          voice_settings: { stability: 0.35, similarity_boost: 0.7 },
-        }),
-      }
-    );
-    if (!r.ok) {
-      const msg = await r.text();
-      return res.status(500).send(`ElevenLabs error: ${msg}`);
-    }
-    res.setHeader("Content-Type", "audio/mpeg");
-    r.body.pipe(res);
+    const text = req.query.text || "Hello, this is ElderMe using Google TTS.";
+    const pcm = await synthesizePcm16_8k(text);
+    const wav = pcm16ToWav8kMono(pcm);
+    res.setHeader("Content-Type", "audio/wav");
+    res.send(wav);
   } catch (e) {
-    res.status(500).send(`TTS failed: ${e.message}`);
+    console.error("Google /tts error:", e);
+    res.status(500).send(String(e));
   }
 });
-
-async function synthesizeMulaw8k(text) {
-  const r = await fetch(
-    `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}/stream`,
-    {
-      method: "POST",
-      headers: {
-        "xi-api-key": ELEVENLABS_API_KEY,
-        "Content-Type": "application/json",
-        "Accept": "audio/ulaw",
-      },
-      body: JSON.stringify({
-        text,
-        model_id: "eleven_multilingual_v2",
-        output_format: "ulaw_8000", // Twilio-ready
-        voice_settings: { stability: 0.35, similarity_boost: 0.7 },
-      }),
-    }
-  );
-  if (!r.ok) {
-    const msg = await r.text();
-    throw new Error(`ElevenLabs error: ${msg}`);
-  }
-  const chunks = [];
-  for await (const chunk of r.body) chunks.push(chunk);
-  return Buffer.concat(chunks);
-}
 
 /* ========= OpenAI ========= */
 async function transcribeWhisper(pcm16Buf) {
@@ -208,20 +220,17 @@ async function chatReply(contextMessages, userText) {
 
 /* ========= HEALTH ========= */
 app.get("/", (_req, res) =>
-  res.send("ElderMe ✅ Twilio Media Streams + ElevenLabs TTS + Conversational loop")
+  res.send("ElderMe ✅ Twilio Media Streams + Google TTS + Conversational loop")
 );
 
-/* ========= INBOUND CALL (fixed Parameter) ========= */
+/* ========= INBOUND CALL (Twilio Media Streams) ========= */
 app.all("/voice", (req, res) => {
   console.log("✓ /voice hit. CallSid:", req.body.CallSid, "From:", req.body.From);
   const vr = new twilio.twiml.VoiceResponse();
-
   const connect = vr.connect();
   const stream = connect.stream({ url: `${PUBLIC_WS}/media` });
-
-  // ✅ Correctly add <Parameter> (avoid "[object Object]")
+  // Pass CallSid properly
   stream.parameter({ name: "callSid", value: req.body.CallSid || "" });
-
   res.type("text/xml").send(vr.toString());
 });
 
@@ -278,7 +287,8 @@ function scheduleNudge(state) {
 async function speakText(state, text) {
   try {
     state.listening = false;
-    const mulaw = await synthesizeMulaw8k(text);
+    const pcm = await synthesizePcm16_8k(text);    // Google TTS PCM16 (8k)
+    const mulaw = encodePcm16ToMulaw(pcm);         // Convert to μ-law for Twilio
     await sendMulawStream(state.ws, state.streamSid, mulaw);
   } catch (e) {
     console.warn("TTS/speak error:", e.stack || e.message);
@@ -295,6 +305,7 @@ async function finalizeTurn(state) {
   state.pcmBuffer = [];
   state.silenceFrames = 0;
 
+  // STT
   let text = "";
   try {
     text = await transcribeWhisper(pcm);
@@ -305,6 +316,7 @@ async function finalizeTurn(state) {
 
   state.context.push({ role: "user", content: text });
 
+  // LLM reply
   let reply = "";
   try {
     reply = await chatReply(state.context, text);
@@ -328,13 +340,10 @@ wss.on("connection", (ws) => {
 
     if (data.event === "start") {
       streamSid = data.start.streamSid;
-
-      // Twilio sends customParameters as an object
       const params =
         (data.start && typeof data.start.customParameters === "object" && data.start.customParameters)
           ? data.start.customParameters
           : {};
-
       callSid = params.callSid || null;
 
       state = makeState(ws, streamSid, callSid);
@@ -347,6 +356,7 @@ wss.on("connection", (ws) => {
       const mu = Buffer.from(data.media.payload, "base64");
       if (!state.listening) return;
 
+      // decode incoming μ-law to PCM16 for VAD + STT buffer
       const pcm = decodeMulawToPcm16(mu);
       state.pcmBuffer.push(pcm);
 

@@ -305,8 +305,8 @@ const wss = new WebSocketServer({ server, path: "/media" });
 // Rotateable nudge lines — edit these to change the opening prompt.
 const NUDGE_LINES = [
   "Hey Rashid, your daughter Cyma told me to call.",
-  "Do you still work with Haroon Shaikh?",
-  "What’s on your mind right now?",
+  " Hey Rashid, your daughter Cyma told me to call . Do you still work with Haroon Shaikh?",
+  " Hey Rashid, your daughter Cyma told me to call . What’s on your mind right now?",
 ];
 
 function makeState(ws, streamSid, callSid) {

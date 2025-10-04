@@ -312,7 +312,7 @@ function scheduleNudge(state) {
   state.nudgeTimer = setTimeout(async () => {
     if (!state || !state.listening) return;
     const seed =
-      "Well, life's good. I just called to check in. What did you eat this morning?";
+      "Hey Rashid, was your dad Mirza? ";
     await speakText(state, seed);
     state.context.push({ role: "assistant", content: seed });
   }, 3000);

@@ -7,7 +7,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 import http from "http";
 import { WebSocketServer } from "ws";
-import { TextToSpeechClient } from "@google-cloud/text-to-speech";
+import fetch from "node-fetch";
 
 const app = express();
 app.use(express.urlencoded({ extended: true }));
@@ -21,41 +21,27 @@ const TWILIO_NUMBER =
   process.env.TWILIO_FROM_NUMBER || process.env.TWILIO_PHONE_NUMBER;
 const CALL_ME_SECRET = process.env.CALL_ME_SECRET || "changeme";
 
+const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
+const ELEVENLABS_VOICE_ID =
+  process.env.ELEVENLABS_VOICE_ID || "kHhWB9Fw3aF6ly7JvltC";
+
 const PUBLIC_URL =
   process.env.PUBLIC_URL || "https://elderme-server.onrender.com";
 const PUBLIC_WS =
   process.env.PUBLIC_WS || PUBLIC_URL.replace(/^http(s?):\/\//, "wss://");
 
-// Voice for Google TTS
-const GOOGLE_TTS_VOICE = process.env.GOOGLE_TTS_VOICE || "en-US-Wavenet-D";
-
-// sanity
 if (!OPENAI_API_KEY) console.warn("⚠️ OPENAI_API_KEY not set");
 if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN)
   console.warn("⚠️ TWILIO SID/TOKEN not set");
 if (!TWILIO_NUMBER) console.warn("⚠️ TWILIO_PHONE_NUMBER not set");
+if (!ELEVENLABS_API_KEY) console.warn("⚠️ ELEVENLABS_API_KEY not set");
+if (!ELEVENLABS_VOICE_ID) console.warn("⚠️ ELEVENLABS_VOICE_ID not set");
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Google TTS auth file from env JSON
-let googleTtsReady = false;
-try {
-  if (process.env.GOOGLE_TTS_KEY) {
-    const keyPath = path.join(__dirname, "google-tts.json");
-    fs.writeFileSync(keyPath, process.env.GOOGLE_TTS_KEY);
-    process.env.GOOGLE_APPLICATION_CREDENTIALS = keyPath;
-    googleTtsReady = true;
-  } else {
-    console.warn("⚠️ GOOGLE_TTS_KEY not set; TTS will be disabled.");
-  }
-} catch (e) {
-  console.warn("⚠️ Failed to write GOOGLE_TTS_KEY file:", e);
-}
-
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 const twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
-const googleTTS = new TextToSpeechClient();
 
 /* ========= STATIC (optional) ========= */
 const AUDIO_DIR = path.join(__dirname, "audio");
@@ -82,31 +68,6 @@ function decodeMulawToPcm16(muBuf) {
   return out;
 }
 
-function pcm16ToMulawSample(sample) {
-  const BIAS = 0x84;
-  let sign = (sample >> 8) & 0x80;
-  if (sign !== 0) sample = -sample;
-  if (sample > 32635) sample = 32635;
-  sample = sample + BIAS;
-
-  let exponent = 7;
-  for (let expMask = 0x4000; (sample & expMask) === 0 && exponent > 0; exponent--, expMask >>= 1) {}
-  const mantissa = (sample >> ((exponent === 0) ? 4 : (exponent + 3))) & 0x0f;
-  let ulaw = ~(sign | (exponent << 4) | mantissa);
-  return ulaw & 0xff;
-}
-
-// PCM16 LE -> μ-law
-function encodePcm16ToMulaw(pcm16Buf) {
-  const samples = pcm16Buf.length / 2;
-  const out = Buffer.alloc(samples);
-  for (let i = 0; i < samples; i++) {
-    const sample = pcm16Buf.readInt16LE(i * 2);
-    out[i] = pcm16ToMulawSample(sample);
-  }
-  return out;
-}
-
 // stream μ-law audio back to Twilio in 20ms frames (8kHz -> 160 bytes/frame)
 async function sendMulawStream(ws, streamSid, mulawBuf) {
   const BYTES_PER_FRAME = 160;
@@ -122,7 +83,7 @@ async function sendMulawStream(ws, streamSid, mulawBuf) {
   }
 }
 
-// write a minimal WAV header around PCM16 mono 8k
+// write a minimal WAV header around PCM16 mono 8k (for Whisper temp files)
 function pcm16ToWav8kMono(pcm) {
   const sampleRate = 8000;
   const byteRate = sampleRate * 2; // 16-bit mono
@@ -139,7 +100,7 @@ function pcm16ToWav8kMono(pcm) {
   buf.writeUInt32LE(16, 16);       // PCM fmt chunk size
   buf.writeUInt16LE(1, 20);        // PCM
   buf.writeUInt16LE(1, 22);        // mono
-  buf.writeUInt32LE(sampleRate, 24);
+  buf.writeUInt32LE(8000, 24);
   buf.writeUInt32LE(byteRate, 28);
   buf.writeUInt16LE(blockAlign, 32);
   buf.writeUInt16LE(bitsPerSample, 34);
@@ -149,24 +110,47 @@ function pcm16ToWav8kMono(pcm) {
   return buf;
 }
 
-/* ---- Google TTS PCM (8k) ---- */
-async function synthesizePcm16_8k(text, voiceName = GOOGLE_TTS_VOICE) {
-  if (!googleTtsReady) throw new Error("Google TTS not configured");
-  const [resp] = await googleTTS.synthesizeSpeech({
-    input: { text },
-    voice: {
-      languageCode: voiceName.slice(0, 5),
-      name: voiceName,
-      ssmlGender: "MALE",
-    },
-    audioConfig: { audioEncoding: "LINEAR16", sampleRateHertz: 8000 },
-  });
-  return Buffer.from(resp.audioContent);
+/* ---- ElevenLabs TTS -> μ-law 8k ----
+   We ask ElevenLabs for "ulaw_8000" so we can send it straight to Twilio.
+*/
+async function synthesizeMulaw8k(text) {
+  if (!ELEVENLABS_API_KEY || !ELEVENLABS_VOICE_ID) {
+    throw new Error("ElevenLabs not configured");
+  }
+
+  const r = await fetch(
+    `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}/stream`,
+    {
+      method: "POST",
+      headers: {
+        "xi-api-key": ELEVENLABS_API_KEY,
+        "Content-Type": "application/json",
+        "Accept": "audio/ulaw"
+      },
+      body: JSON.stringify({
+        text,
+        // model you have access to; "eleven_multilingual_v2" is widely available
+        model_id: "eleven_multilingual_v2",
+        // ask for μ-law 8k output so we can stream directly to Twilio
+        output_format: "ulaw_8000",
+        voice_settings: { stability: 0.35, similarity_boost: 0.7 }
+      })
+    }
+  );
+
+  if (!r.ok) {
+    const msg = await r.text();
+    throw new Error(`ElevenLabs error: ${msg}`);
+  }
+
+  // Collect streamed body into a single Buffer
+  const chunks = [];
+  for await (const chunk of r.body) chunks.push(chunk);
+  return Buffer.concat(chunks);
 }
 
 /* ---- OpenAI: STT + Chat ---- */
 async function transcribeWhisper(pcm16Buf) {
-  // Save temp wav
   const wav = pcm16ToWav8kMono(pcm16Buf);
   const tmp = path.join(AUDIO_DIR, `chunk_${Date.now()}.wav`);
   fs.writeFileSync(tmp, wav);
@@ -177,7 +161,6 @@ async function transcribeWhisper(pcm16Buf) {
     });
     return (resp.text || "").trim();
   } finally {
-    // cleanup
     try { fs.unlinkSync(tmp); } catch {}
   }
 }
@@ -201,12 +184,14 @@ async function chatReply(contextMessages, userText) {
     temperature: 0.7,
     max_tokens: 180
   });
-  const text = (r.choices?.[0]?.message?.content || "").trim() || "Life is good—how are you feeling right now?";
+  const text =
+    (r.choices?.[0]?.message?.content || "").trim() ||
+    "Life is good—how are you feeling right now?";
   return text;
 }
 
 /* ========= HEALTH ========= */
-app.get("/", (_req, res) => res.send("ElderMe ✅ Media Streams + Conversational loop"));
+app.get("/", (_req, res) => res.send("ElderMe ✅ Media Streams + ElevenLabs TTS + Conversational loop"));
 
 /* ========= INBOUND CALL: start media stream ========= */
 app.post("/voice", async (req, res) => {
@@ -267,10 +252,9 @@ function makeState(ws, streamSid, callSid) {
 
 function scheduleNudge(state) {
   if (state.nudgeTimer) clearTimeout(state.nudgeTimer);
-  // if user is quiet for a few seconds, start the convo
   state.nudgeTimer = setTimeout(async () => {
-    if (!state.listening) return; // don't interrupt ourselves
-    const seed = "Well, life's good. I woke up this morning, had a pretty good breakfast. I tried to go for a walk but been busy calling my friends. What did you eat this morning?";
+    if (!state || !state.listening) return;
+    const seed = "Well, life's good. I just called to check in. What did you eat this morning?";
     await speakText(state, seed);
     state.context.push({ role: "assistant", content: seed });
   }, 3000);
@@ -279,14 +263,14 @@ function scheduleNudge(state) {
 async function speakText(state, text) {
   try {
     state.listening = false;
-    const pcm = await synthesizePcm16_8k(text);
-    const mulaw = encodePcm16ToMulaw(pcm);
+    // Get μ-law 8k audio from ElevenLabs and stream to Twilio
+    const mulaw = await synthesizeMulaw8k(text);
     await sendMulawStream(state.ws, state.streamSid, mulaw);
   } catch (e) {
     console.warn("TTS/speak error:", e.message);
   } finally {
     state.listening = true;
-    scheduleNudge(state); // schedule next nudge if user stays quiet
+    scheduleNudge(state);
   }
 }
 
@@ -328,15 +312,9 @@ wss.on("connection", (ws) => {
   let callSid = null;
   let state = null;
 
-  scheduleNudge({}); // no-op placeholder
-
   ws.on("message", async (buf) => {
     let data;
-    try {
-      data = JSON.parse(buf.toString());
-    } catch {
-      return;
-    }
+    try { data = JSON.parse(buf.toString()); } catch { return; }
 
     if (data.event === "start") {
       streamSid = data.start.streamSid;
@@ -410,7 +388,6 @@ wss.on("connection", (ws) => {
 
 /* ========= START SERVER ========= */
 const port = process.env.PORT || 3000;
-const server = http.createServer(app);
 server.listen(port, () => {
   console.log(`Listening on ${port} • WS ${PUBLIC_WS}/media`);
 });

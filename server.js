@@ -214,7 +214,7 @@ async function chatReply(contextMessages, userText) {
   });
   return (
     (r.choices?.[0]?.message?.content || "").trim() ||
-    "Life is good—how are you feeling right now?"
+    "Rashid, I know you, your dad Mirza, your son Sarem?"
   );
 }
 

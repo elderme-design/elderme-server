@@ -21,8 +21,8 @@ const TWILIO_NUMBER =
   process.env.TWILIO_FROM_NUMBER || process.env.TWILIO_PHONE_NUMBER;
 const CALL_ME_SECRET = process.env.CALL_ME_SECRET || "changeme";
 
-const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
-const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID;
+const ELEVENLABS_API_KEY = (process.env.ELEVENLABS_API_KEY || "").trim();
+const ELEVENLABS_VOICE_ID = (process.env.ELEVENLABS_VOICE_ID || "").trim();
 
 const PUBLIC_URL =
   process.env.PUBLIC_URL || "https://elderme-server.onrender.com";
@@ -117,6 +117,7 @@ app.get("/tts", async (req, res) => {
         headers: {
           "xi-api-key": ELEVENLABS_API_KEY,
           "Content-Type": "application/json",
+          "Accept": "audio/mpeg",
         },
         body: JSON.stringify({
           text,
@@ -145,11 +146,12 @@ async function synthesizeMulaw8k(text) {
       headers: {
         "xi-api-key": ELEVENLABS_API_KEY,
         "Content-Type": "application/json",
+        "Accept": "audio/ulaw",
       },
       body: JSON.stringify({
         text,
         model_id: "eleven_multilingual_v2",
-        output_format: "ulaw_8000",
+        output_format: "ulaw_8000", // Twilio-ready
         voice_settings: { stability: 0.35, similarity_boost: 0.7 },
       }),
     }
@@ -217,13 +219,13 @@ app.all("/voice", (req, res) => {
   const connect = vr.connect();
   const stream = connect.stream({ url: `${PUBLIC_WS}/media` });
 
-  // ✅ Correct way to add <Parameter> (avoid "[object Object]")
+  // ✅ Correctly add <Parameter> (avoid "[object Object]")
   stream.parameter({ name: "callSid", value: req.body.CallSid || "" });
 
   res.type("text/xml").send(vr.toString());
 });
 
-/* ========= OUTBOUND CALL (points to /voice) ========= */
+/* ========= OUTBOUND CALL ========= */
 app.post("/call-me", async (req, res) => {
   try {
     if (CALL_ME_SECRET && req.body.secret !== CALL_ME_SECRET)
@@ -246,7 +248,7 @@ app.post("/call-me", async (req, res) => {
   }
 });
 
-/* ========= WEBSOCKET /media: full convo loop ========= */
+/* ========= WEBSOCKET /media ========= */
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: "/media" });
 
@@ -266,7 +268,8 @@ function scheduleNudge(state) {
   if (state.nudgeTimer) clearTimeout(state.nudgeTimer);
   state.nudgeTimer = setTimeout(async () => {
     if (!state || !state.listening) return;
-    const seed = "Well, life's good. I just called to check in. What did you eat this morning?";
+    const seed =
+      "Well, life's good. I just called to check in. What did you eat this morning?";
     await speakText(state, seed);
     state.context.push({ role: "assistant", content: seed });
   }, 3000);
@@ -326,7 +329,7 @@ wss.on("connection", (ws) => {
     if (data.event === "start") {
       streamSid = data.start.streamSid;
 
-      // ✅ FIX: Twilio sends customParameters as an object
+      // Twilio sends customParameters as an object
       const params =
         (data.start && typeof data.start.customParameters === "object" && data.start.customParameters)
           ? data.start.customParameters
